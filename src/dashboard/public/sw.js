@@ -1,4 +1,4 @@
-const CACHE_NAME = "cavor-v1-v2";
+const CACHE_NAME = "cavor-v3-newui";
 const STATIC = ["/", "/angel.png", "/angel2.png", "/manifest.json"];
 
 self.addEventListener("install", e => {
@@ -11,8 +11,16 @@ self.addEventListener("activate", e => {
   );
 });
 self.addEventListener("fetch", e => {
-  if (e.request.url.includes("/api/") || e.request.url.includes("/socket.io/")) return;
+  if (e.request.url.includes("/api/") || e.request.url.includes("/socket.io/") || e.request.url.includes("index.html")) return;
   e.respondWith(
-    caches.match(e.request).then(cached => cached || fetch(e.request).catch(() => cached))
+    caches.match(e.request).then(cached => {
+      return fetch(e.request).then(response => {
+        if (response.ok) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
+        }
+        return response;
+      }).catch(() => cached);
+    })
   );
 });
