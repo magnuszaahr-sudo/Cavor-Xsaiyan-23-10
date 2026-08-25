@@ -120,6 +120,7 @@ body::after{content:'';position:fixed;inset:0;z-index:-1;background:rgba(10,15,3
 .s-cyan{border-color:rgba(34,211,238,.15)}.s-cyan .stat-v{color:var(--cyan)}
 .s-orange{border-color:rgba(251,146,60,.15)}.s-orange .stat-v{color:var(--orange)}
 .s-pink{border-color:rgba(244,114,182,.15)}.s-pink .stat-v{color:var(--pink)}
+.s-red{border-color:rgba(248,113,113,.15)}.s-red .stat-v{color:var(--red)}
 .s-teal{border-color:rgba(34,211,238,.15)}.s-teal .stat-v{color:var(--cyan)}
 
 /* ── Buttons ── */
@@ -671,9 +672,29 @@ img.angel-logo,.angel-bot-av,.angel-icon-sm,.bg-angel-layer,.bg-tab-tint,.bg-par
   </div>
 </div>
 
-<div class="tab-pane" id="tab-cookies">
+  <div class="card">
+    <div class="card-title">🔍 حالة الكوكيز</div>
+    <div id="cookie-status-display" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-bottom:14px;">
+      <div class="stat s-blue"><div class="stat-ic">🔐</div><div class="stat-v" id="ck-status">—</div><div class="stat-l">الحالة</div></div>
+      <div class="stat s-green"><div class="stat-ic">✅</div><div class="stat-v" id="ck-successes">0</div><div class="stat-l">تجديد ناجح</div></div>
+      <div class="stat s-red"><div class="stat-ic">❌</div><div class="stat-v" id="ck-failures">0</div><div class="stat-l">تجديد فاشل</div></div>
+      <div class="stat s-cyan"><div class="stat-ic">⏱</div><div class="stat-v" id="ck-remaining">—</div><div class="stat-l">الوقت المتبقي</div></div>
+      <div class="stat s-purple"><div class="stat-ic">🕐</div><div class="stat-v" id="ck-last-success">—</div><div class="stat-l">آخر تجديد ناجح</div></div>
+      <div class="stat s-yellow"><div class="stat-ic">📡</div><div class="stat-v" id="ck-last-attempt">—</div><div class="stat-l">آخر محاولة</div></div>
+    </div>
+    <div id="ck-failure-reason" style="display:none;padding:10px 14px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);border-radius:var(--r2);font-size:12px;color:var(--red);margin-bottom:14px;"></div>
+    <div class="btn-row" style="margin-bottom:14px;">
+      <button class="btn btn-primary" id="btn-renew-cookie" onclick="renewCookieNow()">🔄 تجديد الآن</button>
+      <button class="btn btn-ghost" onclick="loadCookieStats()">🔄 تحديث الإحصائيات</button>
+    </div>
+  </div>
   <div class="card">
     <div class="card-title">🍪 رفع الكوكيز</div>
+    <div class="fg"><label>الكوكيز — JSON / c3c / Netscape / Header String</label><textarea id="cookieInput" rows="7" placeholder='[{"key":"c_user","value":"..."},{"key":"xs","value":"..."}]'></textarea><div class="hint">✅ يدعم JSON Array، c3c، Netscape، وصيغة key=value</div></div>
+    <div class="btn-row"><button class="btn btn-primary" id="btn-upload-cookies" onclick="uploadCookies()">📤 رفع وتسجيل الدخول</button><button class="btn btn-ghost" onclick="document.getElementById('cookieInput').value=''">🗑 مسح</button></div>
+  </div>
+</div>
+
     <div class="fg"><label>الكوكيز — JSON / c3c / Netscape / Header String</label><textarea id="cookieInput" rows="7" placeholder='[{"key":"c_user","value":"..."},{"key":"xs","value":"..."}]'></textarea><div class="hint">✅ يدعم JSON Array، c3c، Netscape، وصيغة key=value</div></div>
     <div class="btn-row"><button class="btn btn-primary" id="btn-upload-cookies" onclick="uploadCookies()">📤 رفع وتسجيل الدخول</button><button class="btn btn-ghost" onclick="document.getElementById('cookieInput').value=''">🗑 مسح</button></div>
   </div>
@@ -958,6 +979,7 @@ function initSocket() {
   _socket.on("command-updated",  d => { toast(`✅ /${d.name}`, "success"); refreshCmdsIfOpen(); });
   _socket.on("config-reloaded",  () => toast("🔄 الإعدادات تحدثت", "success"));
   _socket.on("pong-bot",         d => toast(`🏓 ${Date.now() - d.ts}ms`, "success"));
+  _socket.on("cookie-stats-update", d => updateCookieStatsUI(d));
   _socket.on("messenger-msg",    d => onMessengerMsg(d));
 }
 
@@ -1059,6 +1081,7 @@ function switchTab(name) {
   _prevTab = name;
   if (name === "commands" || name === "activation") loadCommandsQuiet();
   if (name === "messages") loadMessages();
+  if (name === "cookies") loadCookieStats();
   if (name === "messenger") { loadMessengerThreads(); }
   if (name === "logs") { const box = document.getElementById("logBox"); if (box && _autoScroll) box.scrollTop = box.scrollHeight; }
 
@@ -1085,6 +1108,77 @@ async function uploadCookies() {
   if (r.ok) { toast(`✅ تم رفع ${r.count} كوكي — جاري الدخول…`, "success"); setStatus("connecting","يتصل…"); }
   else toast("❌ " + (r.error || "فشل"), "error");
 }
+/* ─── Cookie Renewal ────────────────────── */
+const STATUS_LABELS = { active: '✅ نشط', expiring: '⚠️ ينتهي قريباً', expired: '❌ منتهي', 'renewal-failed': '🔄 فشل التجديد' };
+const STATUS_COLORS = { active: 'green', expiring: 'yellow', expired: 'red', 'renewal-failed': 'orange' };
+
+function _fmtTimeAgo(ts) {
+  if (!ts) return '—';
+  const diff = Date.now() - ts;
+  if (diff < 60000) return 'الآن';
+  if (diff < 3600000) return Math.floor(diff/60000) + ' دقيقة';
+  if (diff < 86400000) return Math.floor(diff/3600000) + ' ساعة';
+  return Math.floor(diff/86400000) + ' يوم';
+}
+
+function _fmtRemaining(ms) {
+  if (!ms || ms <= 0) return '—';
+  const h = Math.floor(ms/3600000);
+  const m = Math.floor((ms%3600000)/60000);
+  if (h > 0) return h + ' ساعة ' + m + ' دقيقة';
+  return m + ' دقيقة';
+}
+
+function updateCookieStatsUI(data) {
+  document.getElementById('ck-status').textContent = STATUS_LABELS[data.status] || data.status || '—';
+  document.getElementById('ck-successes').textContent = data.renewSuccesses || 0;
+  document.getElementById('ck-failures').textContent = data.renewFailures || 0;
+  document.getElementById('ck-remaining').textContent = _fmtRemaining(data.remainingMs);
+  document.getElementById('ck-last-success').textContent = _fmtTimeAgo(data.lastSuccessTs);
+  document.getElementById('ck-last-attempt').textContent = _fmtTimeAgo(data.lastAttemptTs);
+  // Color the status stat
+  const sc = STATUS_COLORS[data.status] || 'blue';
+  const stEl = document.getElementById('ck-status');
+  if (stEl) { stEl.className = 'stat-v'; stEl.style.color = 'var(--' + sc + ')'; }
+  // Failure reason
+  const reasonEl = document.getElementById('ck-failure-reason');
+  if (reasonEl) {
+    if (data.lastFailureReason && data.renewFailures > 0) {
+      reasonEl.style.display = 'block';
+      reasonEl.innerHTML = '⚠️ آخر خطأ: ' + data.lastFailureReason;
+    } else { reasonEl.style.display = 'none'; }
+  }
+  // Renew button state
+  const btn = document.getElementById('btn-renew-cookie');
+  if (btn) { btn.disabled = !!data.renewing; btn.textContent = data.renewing ? '⏳ جاري التجديد…' : '🔄 تجديد الآن'; }
+}
+
+async function loadCookieStats() {
+  try {
+    const r = await apiFetch('/api/cookies/stats');
+    if (r.ok) updateCookieStatsUI(r);
+  } catch (_) {}
+}
+
+async function renewCookieNow() {
+  const btn = document.getElementById('btn-renew-cookie');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ جاري التجديد…'; }
+  try {
+    const r = await apiFetch('/api/cookies/renew', { method: 'POST', body: '{}' });
+    if (r.ok) {
+      toast('✅ تم تجديد الكوكيز بنجاح', 'success');
+      loadCookieStats();
+    } else {
+      toast('❌ ' + (r.error || 'فشل التجديد'), 'error');
+      loadCookieStats();
+    }
+  } catch (e) {
+    toast('❌ خطأ: ' + e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 تجديد الآن'; }
+  }
+}
+
+// Listen for real-time cookie stats updates via Socket.io
 async function controlBot(action) {
   if (action === "stop" && !confirm("⚠️ هل أنت متأكد؟")) return;
   const btn = document.getElementById(action === "restart" ? "btn-restart" : "btn-stop");

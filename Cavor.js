@@ -282,6 +282,8 @@ async function startBot() {
           global._selfWrite = true;
           fs.writeFileSync(ACCOUNT_PATH, JSON.stringify(extras.appState, null, 2));
           setTimeout(() => { global._selfWrite = false; }, 6000);
+          // Notify cookie renewal system
+          if (typeof global._onCookieSaved === "function") global._onCookieSaved();
         }
       } catch (_) {}
 

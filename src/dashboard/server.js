@@ -78,6 +78,211 @@ function getDashPwd() {
   } catch (_) { return "cavor2025"; }
 }
 
+// ═══ Cookie Renewal System ═══════════════════════════════════════════════════════
+const COOKIE_STATS_PATH = path.join(ROOT, "database/data/cookieStats.json");
+const COOKIE_LIFETIME_MS = 5 * 3600 * 1000; // ~5 hours expected cookie lifetime
+const COOKIE_CHECK_INTERVAL_MS = 30 * 60 * 1000; // check every 30 minutes
+const COOKIE_EXPIRING_SOON_MS = 60 * 60 * 1000; // 1 hour before expiry
+let _cookieRenewalTimer = null;
+let _cookieRenewalInProgress = false;
+let _cookieRenewalLastError = null;
+
+const _defaultCookieStats = {
+  renewSuccesses: 0,
+  renewFailures: 0,
+  lastSuccessTs: 0,
+  lastAttemptTs: 0,
+  lastFailureTs: 0,
+  lastFailureReason: "",
+  lastCookieSavedTs: 0,
+  estimatedExpiryTs: 0,
+  totalChecks: 0,
+};
+
+let _cookieStats = { ..._defaultCookieStats };
+
+function _loadCookieStats() {
+  try {
+    if (fs.existsSync(COOKIE_STATS_PATH)) {
+      const data = JSON.parse(fs.readFileSync(COOKIE_STATS_PATH, "utf8"));
+      _cookieStats = { ..._defaultCookieStats, ...data };
+    }
+  } catch (_) {
+    _cookieStats = { ..._defaultCookieStats };
+  }
+}
+
+function _saveCookieStats() {
+  try {
+    fs.ensureDirSync(path.dirname(COOKIE_STATS_PATH));
+    fs.writeFileSync(COOKIE_STATS_PATH, JSON.stringify(_cookieStats, null, 2));
+  } catch (_) {}
+}
+
+function _getCookieStatus() {
+  const now = Date.now();
+  const expiry = _cookieStats.estimatedExpiryTs || 0;
+  const lastSaved = _cookieStats.lastCookieSavedTs || _cookieStats.lastSuccessTs || 0;
+
+  // No cookies ever saved
+  if (!lastSaved) return "expired";
+
+  // No estimated expiry yet — treat as active since we just saved
+  if (!expiry) return "active";
+
+  const remaining = expiry - now;
+
+  if (remaining <= 0) return "expired";
+  if (remaining <= COOKIE_EXPIRING_SOON_MS) return "expiring";
+  return "active";
+}
+
+function _getRemainingMs() {
+  const expiry = _cookieStats.estimatedExpiryTs || 0;
+  if (!expiry) return 0;
+  const rem = expiry - Date.now();
+  return rem > 0 ? rem : 0;
+}
+
+function _emitCookieStats() {
+  if (!_io) return;
+  const status = _getCookieStatus();
+  const remainingMs = _getRemainingMs();
+  _io.emit("cookie-stats-update", {
+    renewSuccesses: _cookieStats.renewSuccesses,
+    renewFailures: _cookieStats.renewFailures,
+    lastSuccessTs: _cookieStats.lastSuccessTs,
+    lastAttemptTs: _cookieStats.lastAttemptTs,
+    lastFailureTs: _cookieStats.lastFailureTs,
+    lastFailureReason: _cookieStats.lastFailureReason || "",
+    status,
+    remainingMs,
+    estimatedExpiryTs: _cookieStats.estimatedExpiryTs,
+    renewing: _cookieRenewalInProgress,
+  });
+}
+
+/**
+ * Core renewal function — validates current cookie and optionally re-saves it
+ * to reset the expiry timer. Does NOT touch the actual cookie value unless
+ * a fresh one is obtained from FCA extras.appState.
+ */
+async function _renewCookie(manual = false) {
+  if (_cookieRenewalInProgress) return { ok: false, error: "التجديد جارٍ بالفعل" };
+  _cookieRenewalInProgress = true;
+  _cookieRenewalLastError = null;
+  _cookieStats.lastAttemptTs = Date.now();
+  _cookieStats.totalChecks++;
+  _emitCookieStats();
+
+  try {
+    // Read current cookies
+    if (!fs.existsSync(ACCOUNT_PATH)) {
+      throw new Error("لا توجد ملف كوكيز");
+    }
+    const rawCookie = fs.readFileSync(ACCOUNT_PATH, "utf8").trim();
+    if (!rawCookie) {
+      throw new Error("ملف الكوكيز فارغ");
+    }
+
+    const CavorFCA = require("../../Cavor-fca");
+    const parsed = CavorFCA.parseCookieInput(rawCookie);
+    const cookies = parsed.cookies;
+
+    if (!cookies.length || !CavorFCA.hasMandatory(cookies)) {
+      throw new Error("كوكيز ناقصة (c_user أو xs مفقود)");
+    }
+
+    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+    const UA = config.facebookAccount?.userAgent || CavorFCA.getUA();
+    const cookieStr = CavorFCA.cookiesToString(cookies);
+
+    // Validate cookie is still live
+    _cookieStats.totalChecks++;
+    const valid = await CavorFCA.checkLiveCookie(cookieStr, UA);
+
+    if (valid) {
+      // Cookie is still live — re-save it to reset the timer
+      // (FCA sometimes returns refreshed appState with same cookies)
+      const api = global.GoatBot?.fcaApi;
+      if (api && typeof api.getAppState === "function") {
+        try {
+          const freshState = api.getAppState();
+          if (freshState && freshState.length) {
+            global._selfWrite = true;
+            fs.writeFileSync(ACCOUNT_PATH, JSON.stringify(freshState, null, 2));
+            setTimeout(() => { global._selfWrite = false; }, 6000);
+          }
+        } catch (_) {
+          // If getAppState fails, re-save existing cookies — they're still valid
+          global._selfWrite = true;
+          fs.writeFileSync(ACCOUNT_PATH, JSON.stringify(cookies, null, 2));
+          setTimeout(() => { global._selfWrite = false; }, 6000);
+        }
+      } else {
+        // No API available, re-save existing cookies
+        global._selfWrite = true;
+        fs.writeFileSync(ACCOUNT_PATH, JSON.stringify(cookies, null, 2));
+        setTimeout(() => { global._selfWrite = false; }, 6000);
+      }
+
+      _cookieStats.lastSuccessTs = Date.now();
+      _cookieStats.renewSuccesses++;
+      _cookieStats.lastCookieSavedTs = Date.now();
+      _cookieStats.estimatedExpiryTs = Date.now() + COOKIE_LIFETIME_MS;
+      _cookieStats.lastFailureReason = "";
+      _saveCookieStats();
+      _cookieRenewalInProgress = false;
+      _emitCookieStats();
+
+      const label = manual ? "تجديد يدوي" : "تجديد تلقائي";
+      console.log(`[CookieRenewal] ✅ ${label} — نجح (${_cookieStats.renewSuccesses} إجمالي)`);
+      return { ok: true };
+    } else {
+      throw new Error("الكوكيز منتهية الصلاحية (mbasic فشل)");
+    }
+  } catch (e) {
+    _cookieStats.lastFailureTs = Date.now();
+    _cookieStats.renewFailures++;
+    _cookieStats.lastFailureReason = (e.message || String(e)).slice(0, 200);
+    _cookieRenewalLastError = _cookieStats.lastFailureReason;
+    _saveCookieStats();
+    _cookieRenewalInProgress = false;
+    _emitCookieStats();
+    console.log(`[CookieRenewal] ❌ فشل: ${_cookieStats.lastFailureReason}`);
+    return { ok: false, error: _cookieStats.lastFailureReason };
+  }
+}
+
+function _startCookieRenewalTimer() {
+  _loadCookieStats();
+  if (_cookieRenewalTimer) clearInterval(_cookieRenewalTimer);
+  _cookieRenewalTimer = setInterval(() => {
+    const status = _getCookieStatus();
+    // Only attempt renewal if expired or expiring
+    if (status === "expired" || status === "expiring") {
+      console.log(`[CookieRenewal] ⏰ الحالة: ${status} — محاولة تجديد…`);
+      _renewCookie(false);
+    } else {
+      // Even if active, periodically emit stats so dashboard stays current
+      _emitCookieStats();
+    }
+  }, COOKIE_CHECK_INTERVAL_MS);
+}
+
+function _stopCookieRenewalTimer() {
+  if (_cookieRenewalTimer) { clearInterval(_cookieRenewalTimer); _cookieRenewalTimer = null; }
+}
+
+// Notify when bot saves new cookies (from FCA login)
+function _onCookieSaved() {
+  _cookieStats.lastCookieSavedTs = Date.now();
+  _cookieStats.estimatedExpiryTs = Date.now() + COOKIE_LIFETIME_MS;
+  _saveCookieStats();
+  _emitCookieStats();
+}
+global._onCookieSaved = _onCookieSaved;
+
 // ── Live log interceptor ──────────────────────────────────────────────────────
 function interceptLogs() {
   const origWrite = process.stdout.write.bind(process.stdout);
@@ -237,9 +442,35 @@ function startDashboard(port = 5000) {
       global._selfWrite = true;
       fs.writeFileSync(ACCOUNT_PATH, JSON.stringify(cookies, null, 2));
       setTimeout(() => { global._selfWrite = false; }, 6000);
+      if (typeof global._onCookieSaved === "function") global._onCookieSaved();
       res.json({ ok: true, count: cookies.length });
       setTimeout(() => { try { global.startBot?.(); } catch (_) {} }, 1500);
     } catch (e) { res.json({ ok: false, error: e.message }); }
+  });
+
+  // ── Cookie Renewal Stats ─────────────────────────────────────────────────────
+  app.get("/api/cookies/stats", auth, (_, res) => {
+    _loadCookieStats();
+    const status = _getCookieStatus();
+    const remainingMs = _getRemainingMs();
+    res.json({
+      ok: true,
+      renewSuccesses: _cookieStats.renewSuccesses,
+      renewFailures: _cookieStats.renewFailures,
+      lastSuccessTs: _cookieStats.lastSuccessTs,
+      lastAttemptTs: _cookieStats.lastAttemptTs,
+      lastFailureTs: _cookieStats.lastFailureTs,
+      lastFailureReason: _cookieStats.lastFailureReason || "",
+      status,
+      remainingMs,
+      estimatedExpiryTs: _cookieStats.estimatedExpiryTs,
+      renewing: _cookieRenewalInProgress,
+    });
+  });
+
+  app.post("/api/cookies/renew", auth, async (_, res) => {
+    const result = await _renewCookie(true);
+    res.json(result);
   });
 
   // ── Admins Management ────────────────────────────────────────────────────────
@@ -463,6 +694,8 @@ function startDashboard(port = 5000) {
     });
     // Send last 100 log lines
     socket.emit("log-history", _logBuf.slice(-100));
+    // Send cookie stats
+    _emitCookieStats();
 
     socket.on("ping-bot", () => socket.emit("pong-bot", { ts: Date.now() }));
   });
@@ -1325,6 +1558,8 @@ module.exports = {
 
   setInterval(() => { if (_io) _io.emit("stats-update", getStats()); }, 5000);
 
+  // Start cookie renewal timer
+  _startCookieRenewalTimer();
   return new Promise((resolve, reject) => {
     _server.listen(port, "0.0.0.0", () => {
       console.log();
