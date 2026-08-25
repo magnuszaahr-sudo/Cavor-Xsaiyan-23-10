@@ -1,0 +1,8 @@
+{
+  "name": "cavor-fca",
+  "version": "4.0.0",
+  "description": "Cavor-FCA — Facebook Client Abstractions للـ Cavor. إرسال الصور والفيديوهات والصوت من URL. Copyright © 2025 CAVOR.",
+  "main": "index.js",
+  "author": "CAVOR",
+  "license": "MIT"
+}
